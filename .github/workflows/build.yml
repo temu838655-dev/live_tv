@@ -1,0 +1,101 @@
+name: Build APK
+
+# Cách dùng:
+#  - Build thử:      tab Actions > Build APK > Run workflow (để trống ô tag) > tải APK ở mục Artifacts.
+#  - Tạo bản Release: Run workflow và điền tag (vd v1.0.0), hoặc đẩy tag:  git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag để tạo Release (vd v1.0.0). Để trống = chỉ build, không tạo Release"
+        required: false
+        default: ""
+
+# Cần quyền ghi để tạo Release
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    steps:
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Cài Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cài Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Chuẩn bị khóa ký (nếu có)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "Đã nạp khóa ký riêng."
+          else
+            echo "Không có KEYSTORE_BASE64: APK sẽ ký bằng khóa debug."
+          fi
+
+      - name: Build APK
+        env:
+          TMDB_KEY: ${{ secrets.TMDB_KEY }}
+          YOUTUBE_KEY: ${{ secrets.YOUTUBE_KEY }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ -n "$TAG" ]; then export BUILD_NAME="${TAG#v}"; fi
+          sh build_apk.sh
+
+      - name: Lưu APK vào Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: live_tv-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Đăng lên Releases
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          APK=$(ls dist/*.apk | head -n 1)
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          **Cách cài:** tải file `.apk` ở mục *Assets* bên dưới về điện thoại Android, mở file và cho phép "Cài đặt từ nguồn không xác định" khi được hỏi.
+
+          Nếu cài đè lên bản cũ báo lỗi, hãy gỡ bản cũ rồi cài lại (chỉ xảy ra khi chưa cấu hình khóa ký riêng, xem README).
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" \
+              --title "Truyền hình $TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              --target "$GITHUB_SHA"
+          fi
